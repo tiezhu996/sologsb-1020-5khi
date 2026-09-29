@@ -1,4 +1,4 @@
-import type { ArchiveRecord, ArchiveState } from '../types';
+import type { ArchiveRecord, ArchiveState, PersistedSlice } from '../types';
 import { computeMatches } from '../utils/matching';
 
 const now = new Date().toISOString();
@@ -40,16 +40,20 @@ export const seedRecords = (): ArchiveRecord[] => [
   makeRecord('b-008', 'B', '何玉莲女书唱本扫描件', '2013-05-18', ['何玉莲'], ['上江乡'], 'MANU-HYL-13', '扫描件', '41页', '联系人待定', '扫描时第12页缺失')
 ];
 
-export const seedState = (): ArchiveState => {
+export const seedSlice = (): PersistedSlice => {
   const records = seedRecords();
   return {
     revision: 1,
     records,
     matches: computeMatches(records),
     merges: [],
-    audit: [{ id: 'seed', at: now, action: '初始化数据', detail: '导入两组示例口述史与手稿记录并完成首轮匹配', recordIds: [] }],
-    activeMatchId: '',
-    selectedRecordIds: [],
-    hydrated: false
+    audit: [{ id: 'seed', at: now, action: '初始化数据', detail: '导入两组示例口述史与手稿记录并完成首轮匹配', recordIds: [], rev: 1 }]
   };
 };
+
+export const seedState = (): ArchiveState => ({
+  ...seedSlice(),
+  activeMatchId: '',
+  selectedRecordIds: [],
+  hydrated: false
+});
