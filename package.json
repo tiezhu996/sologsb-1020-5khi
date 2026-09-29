@@ -1,0 +1,20 @@
+{
+  "name": "sologsb-1020-archive-reconciliation",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --mode ssr",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@builder.io/qwik": "^1.20.1",
+    "@qwik-ui/headless": "^0.7.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.7"
+  }
+}
