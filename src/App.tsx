@@ -2,15 +2,18 @@ import {
   $, component$, useComputed$, useSignal, useStore, useVisibleTask$
 } from '@builder.io/qwik';
 import { Checkbox, Modal, Tabs } from '@qwik-ui/headless';
-import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup } from './types';
-import { computeMatches, fieldValue, scorePair } from './utils/matching';
+import type {
+  AffectedPair, ArchiveRecord, ArchiveState, Checkpoint, ConflictInfo,
+  FieldKey, MatchCandidate, PendingMarker, RecoveryNotice, RecordGroup, WorkspaceData
+} from './types';
+import { computeMatches, fieldValue } from './utils/matching';
+import { fieldLabels } from './utils/fields';
 import { seedState } from './data/seed';
-
-const STORAGE_KEY = 'sologsb-1020-archive-state-v1';
-const fieldLabels: Array<[FieldKey, string]> = [
-  ['title', '标题'], ['date', '日期'], ['people', '人物'], ['places', '地点'], ['identifier', '编号'],
-  ['medium', '载体'], ['extent', '数量'], ['rights', '权利'], ['notes', '备注']
-];
+import {
+  acquireLease, boot, buildLeaseConflict, buildVersionConflict, clearPending, createCheckpoint,
+  downloadJson, loadCheckpoints, loadEnvelope, loadErrorBundles,
+  releaseLease, saveEnvelope, writePending, createHolder, nowIso, type StorageLike
+} from './utils/workspace';
 
 const parseDate = (value: string) => {
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value.split('-').reverse().join('/');
@@ -24,6 +27,9 @@ const matchLabel = (state: ArchiveState, match: MatchCandidate) => {
   const right = recordById(state, match.rightId);
   return `${left?.title ?? '未知记录'} ↔ ${right?.title ?? '未知记录'}`;
 };
+const pairText = (state: ArchiveState, pair: AffectedPair) =>
+  `${pair.leftTitle ?? recordById(state, pair.leftId)?.title ?? pair.leftId} ↔ ${pair.rightTitle ?? recordById(state, pair.rightId)?.title ?? pair.rightId}`;
+const conflictKindLabel: Record<string, string> = { record: '记录', match: '匹配', merge: '合并' };
 
 export default component$(() => {
   const state = useStore<ArchiveState>(seedState());
@@ -36,11 +42,22 @@ export default component$(() => {
   const selectedMatchIds = useSignal<string[]>([]);
   const importOpen = useSignal(false);
   const mergeOpen = useSignal(false);
+  const checkpointOpen = useSignal(false);
+  const conflictOpen = useSignal(false);
   const importGroup = useSignal<RecordGroup>('A');
   const importRaw = useSignal('');
   const importText = useSignal('');
   const toast = useSignal('');
   const panelTab = useSignal(0);
+
+  // 版本凭据与多页面协作
+  const holder = useSignal('');
+  const baseVersion = useSignal(1);
+  const checkpoints = useSignal<Checkpoint[]>([]);
+  const conflict = useSignal<ConflictInfo | null>(null);
+  const notices = useSignal<RecoveryNotice[]>([]);
+  const remoteAhead = useSignal<{ version: number; action: string; by: string } | null>(null);
+  const remotePending = useSignal<string>('');
 
   const snapshot = () => JSON.stringify({
     revision: state.revision,
@@ -49,11 +66,13 @@ export default component$(() => {
     merges: state.merges,
     audit: state.audit
   });
-
-  const capture = () => {
-    history.value = [...history.value.slice(-49), snapshot()];
-    future.value = [];
-  };
+  const snapshotData = (): WorkspaceData => ({
+    revision: state.revision,
+    records: state.records,
+    matches: state.matches,
+    merges: state.merges,
+    audit: state.audit
+  });
 
   const restore = (raw: string) => {
     const next = JSON.parse(raw) as Partial<ArchiveState>;
@@ -66,7 +85,12 @@ export default component$(() => {
 
   const notify = (message: string) => {
     toast.value = message;
-    window.setTimeout(() => { if (toast.value === message) toast.value = ''; }, 2800);
+    window.setTimeout(() => { if (toast.value === message) toast.value = ''; }, 3200);
+  };
+
+  const showConflict = (info: ConflictInfo) => {
+    conflict.value = info;
+    conflictOpen.value = true;
   };
 
   const commit = (action: string, detail: string, recordIds: string[] = []) => {
@@ -75,20 +99,106 @@ export default component$(() => {
     state.audit = state.audit.slice(0, 300);
   };
 
+  /**
+   * 受版本保护的提交流程：
+   * 1. 提交前领取编辑权（其他页面正在保存则拦截）
+   * 2. 记录撤销快照，并在提交前落盘检查点与进行中标记
+   * 3. 执行本地修改；写入时携带当时版本做乐观锁校验
+   * 4. 版本落后则拦住写入、回滚本地改动，交由冲突弹窗指出对方动作与差异
+   */
+  const runGuarded = (
+    action: string,
+    detail: string,
+    pairs: AffectedPair[],
+    mutate: () => void,
+    options: { manageHistory?: boolean } = {}
+  ): boolean => {
+    const storage: StorageLike = localStorage;
+    if (!state.hydrated || !holder.value) { notify('工作区仍在恢复，请稍候再操作'); return false; }
+
+    const lease = acquireLease(storage, holder.value, action);
+    if (!lease.ok || !lease.lease) {
+      const c = lease.conflict!;
+      showConflict(buildLeaseConflict(action, baseVersion.value, c.holder, c.expiresAt, c.action));
+      return false;
+    }
+
+    const before = snapshot();
+    let pushedHistory = false;
+    if (!options.manageHistory) {
+      history.value = [...history.value.slice(-49), before];
+      pushedHistory = true;
+    }
+
+    let checkpointId = '';
+    try {
+      const cp = createCheckpoint(storage, action, detail, baseVersion.value, JSON.parse(before) as WorkspaceData, pairs);
+      checkpointId = cp.id;
+      checkpoints.value = [cp, ...checkpoints.value].slice(0, 20);
+    } catch {
+      // 检查点落盘失败不应阻止正常提交，进行中标记会记录无检查点的情况。
+    }
+    writePending(storage, {
+      startedAt: nowIso(), action, detail, baseVersion: baseVersion.value, checkpointId, holder: holder.value
+    });
+
+    try {
+      mutate();
+    } catch (error) {
+      restore(before);
+      clearPending(storage);
+      releaseLease(storage, holder.value);
+      notify(`操作未完成，已回到操作前状态：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+
+    const result = saveEnvelope(storage, snapshotData(), baseVersion.value, holder.value, action);
+    clearPending(storage);
+    releaseLease(storage, holder.value);
+
+    if (!result.ok || !result.envelope) {
+      // 版本落后：写入被拦截，本地改动回滚，等待用户看完差异重新领取。
+      restore(before);
+      if (pushedHistory) history.value = history.value.slice(0, -1);
+      if (result.conflict) showConflict(result.conflict);
+      checkpoints.value = loadCheckpoints(storage).checkpoints;
+      notify('版本落后，写入已拦截，请查看冲突差异');
+      return false;
+    }
+
+    baseVersion.value = result.envelope.version;
+    state.revision = result.envelope.version;
+    if (pushedHistory) future.value = [];
+    remoteAhead.value = null;
+    remotePending.value = '';
+    checkpoints.value = loadCheckpoints(storage).checkpoints;
+    return true;
+  };
+
   const undo = $(() => {
     const raw = history.value.at(-1);
     if (!raw) return;
-    future.value = [...future.value, snapshot()];
-    history.value = history.value.slice(0, -1);
-    restore(raw);
+    const previousAction = state.audit[0]?.action ?? '上一步';
+    const current = snapshot();
+    const ok = runGuarded('撤销操作', `撤销：${previousAction}`, [], () => restore(raw), { manageHistory: true });
+    if (ok) {
+      history.value = history.value.slice(0, -1);
+      future.value = [...future.value, current];
+      notify(`已撤销：${previousAction}`);
+    }
   });
 
   const redo = $(() => {
     const raw = future.value.at(-1);
     if (!raw) return;
-    history.value = [...history.value, snapshot()];
-    future.value = future.value.slice(0, -1);
-    restore(raw);
+    const nextAction = (JSON.parse(raw) as Partial<ArchiveState>).audit?.[0]?.action ?? '下一步';
+    const current = snapshot();
+    const ok = runGuarded('重做操作', `重做：${nextAction}`, [], () => restore(raw), { manageHistory: true });
+    if (ok) {
+      future.value = future.value.slice(0, -1);
+      history.value = [...history.value, current];
+      notify(`已重做：${nextAction}`);
+    }
   });
 
   const filteredRecords = useComputed$(() => {
@@ -108,35 +218,53 @@ export default component$(() => {
   const activeMatch = useComputed$(() => state.matches.find((match) => match.id === state.activeMatchId) ?? filteredMatches.value[0]);
   const conflictCount = useComputed$(() => state.matches.filter((match) => match.status === 'suggested' && match.score < .68).length);
 
+  const matchPairs = (ids: string[], reason: string): AffectedPair[] => ids.flatMap((id) => {
+    const match = state.matches.find((item) => item.id === id);
+    if (!match) return [];
+    const left = recordById(state, match.leftId);
+    const right = recordById(state, match.rightId);
+    return [{ leftId: match.leftId, rightId: match.rightId, leftTitle: left?.title, rightTitle: right?.title, reason }];
+  });
+
   const updateMatch = $((id: string, status: MatchCandidate['status']) => {
-    capture();
     const match = state.matches.find((item) => item.id === id);
     if (!match) return;
-    match.status = status;
-    match.reviewedAt = new Date().toISOString();
-    state.records.forEach((record) => {
-      if ((record.id === match.leftId || record.id === match.rightId) && status === 'confirmed') record.status = 'confirmed';
+    const confirming = status === 'confirmed';
+    const action = confirming ? '确认匹配' : '忽略可疑匹配';
+    const detail = matchLabel(state, match);
+    const ok = runGuarded(action, detail, matchPairs([id], action), () => {
+      match.status = status;
+      match.reviewedAt = new Date().toISOString();
+      state.records.forEach((record) => {
+        if ((record.id === match.leftId || record.id === match.rightId) && confirming) record.status = 'confirmed';
+      });
+      commit(action, detail, [match.leftId, match.rightId]);
     });
-    commit(status === 'confirmed' ? '确认匹配' : '忽略可疑匹配', matchLabel(state, match), [match.leftId, match.rightId]);
-    notify(status === 'confirmed' ? '已确认此项匹配' : '已忽略此项匹配');
+    if (ok) notify(confirming ? '已确认此项匹配' : '已忽略此项匹配');
   });
 
   const bulkMatch = $((status: MatchCandidate['status']) => {
     const ids = selectedMatchIds.value;
     if (!ids.length) return;
-    capture();
-    ids.forEach((id) => {
-      const match = state.matches.find((item) => item.id === id);
-      if (!match) return;
-      match.status = status;
-      match.reviewedAt = new Date().toISOString();
-    });
-    commit('批量复核', `${ids.length} 条匹配被标记为${status === 'confirmed' ? '确认' : '忽略'}`, ids.flatMap((id) => {
+    const action = '批量复核';
+    const detail = `${ids.length} 条匹配被标记为${status === 'confirmed' ? '确认' : '忽略'}`;
+    const recordIds = ids.flatMap((id) => {
       const match = state.matches.find((item) => item.id === id);
       return match ? [match.leftId, match.rightId] : [];
-    }));
-    selectedMatchIds.value = [];
-    notify(`已批量处理 ${ids.length} 条匹配`);
+    });
+    const ok = runGuarded(action, detail, matchPairs(ids, status === 'confirmed' ? '批量确认' : '批量忽略'), () => {
+      ids.forEach((id) => {
+        const match = state.matches.find((item) => item.id === id);
+        if (!match) return;
+        match.status = status;
+        match.reviewedAt = new Date().toISOString();
+      });
+      commit(action, detail, recordIds);
+    });
+    if (ok) {
+      selectedMatchIds.value = [];
+      notify(`已批量处理 ${ids.length} 条匹配`);
+    }
   });
 
   const openMerge = $(() => {
@@ -162,38 +290,46 @@ export default component$(() => {
     const left = recordById(state, match.leftId);
     const right = recordById(state, match.rightId);
     if (!left || !right) return;
-    capture();
-    const values: Partial<Record<FieldKey, string>> = {};
-    fieldLabels.forEach(([field]) => {
-      const source = choices[field];
-      const pick = source === 'combine' ? `${fieldValue(left, field)}；${fieldValue(right, field)}` : fieldValue(source === 'A' ? left : right, field);
-      values[field] = pick;
+    const action = '合并两条记录';
+    const detail = `保留 ${Object.values(choices).filter((choice) => choice === 'A').length} 个 A 来源字段、${Object.values(choices).filter((choice) => choice === 'B').length} 个 B 来源字段`;
+    const pairs: AffectedPair[] = [{
+      leftId: left.id, rightId: right.id, leftTitle: left.title, rightTitle: right.title, reason: '合并为一条新记录'
+    }];
+    const ok = runGuarded(action, detail, pairs, () => {
+      const values: Partial<Record<FieldKey, string>> = {};
+      fieldLabels.forEach(([field]) => {
+        const source = choices[field];
+        const pick = source === 'combine' ? `${fieldValue(left, field)}；${fieldValue(right, field)}` : fieldValue(source === 'A' ? left : right, field);
+        values[field] = pick;
+      });
+      const merged: ArchiveRecord = {
+        ...left,
+        ...values,
+        people: values.people?.split(/[；、,，]/).map((item) => item.trim()).filter(Boolean) ?? left.people,
+        places: values.places?.split(/[；、,，]/).map((item) => item.trim()).filter(Boolean) ?? left.places,
+        status: 'merged',
+        updatedAt: new Date().toISOString()
+      };
+      state.records = [...state.records.filter((record) => record.id !== left.id && record.id !== right.id), merged];
+      state.matches.forEach((item) => {
+        if (item.id === match.id) item.status = 'merged';
+        else if (item.leftId === left.id || item.rightId === right.id || item.leftId === right.id || item.rightId === left.id) item.status = 'rejected';
+      });
+      state.merges.unshift({
+        id: crypto.randomUUID(),
+        matchId: match.id,
+        leftId: left.id,
+        rightId: right.id,
+        chosen: { ...choices },
+        values,
+        mergedAt: new Date().toISOString()
+      });
+      commit(action, detail, [left.id, right.id, merged.id]);
     });
-    const merged: ArchiveRecord = {
-      ...left,
-      ...values,
-      people: values.people?.split(/[；、,，]/).map((item) => item.trim()).filter(Boolean) ?? left.people,
-      places: values.places?.split(/[；、,，]/).map((item) => item.trim()).filter(Boolean) ?? left.places,
-      status: 'merged',
-      updatedAt: new Date().toISOString()
-    };
-    state.records = [...state.records.filter((record) => record.id !== left.id && record.id !== right.id), merged];
-    state.matches.forEach((item) => {
-      if (item.id === match.id) item.status = 'merged';
-      else if (item.leftId === left.id || item.rightId === right.id || item.leftId === right.id || item.rightId === left.id) item.status = 'rejected';
-    });
-    state.merges.unshift({
-      id: crypto.randomUUID(),
-      matchId: match.id,
-      leftId: left.id,
-      rightId: right.id,
-      chosen: { ...choices },
-      values,
-      mergedAt: new Date().toISOString()
-    });
-    commit('合并两条记录', `保留 ${Object.values(choices).filter((choice) => choice === 'A').length} 个 A 来源字段、${Object.values(choices).filter((choice) => choice === 'B').length} 个 B 来源字段`, [left.id, right.id, merged.id]);
-    mergeOpen.value = false;
-    notify('记录已合并，来源与字段选择已写入审计记录');
+    if (ok) {
+      mergeOpen.value = false;
+      notify('记录已合并，来源与字段选择已写入审计记录');
+    }
   });
 
   const parseImport = $(() => {
@@ -224,31 +360,36 @@ export default component$(() => {
       return;
     }
     if (!rows.length) return;
-    capture();
-    rows.forEach((row) => {
-      const record: ArchiveRecord = {
-        id: crypto.randomUUID(),
-        group: importGroup.value,
-        title: row.title || '未命名记录',
-        date: row.date || '',
-        people: Array.isArray(row.people) ? row.people : String(row.people || '').split(/[，,、]/).filter(Boolean),
-        places: Array.isArray(row.places) ? row.places : String(row.places || '').split(/[，,、]/).filter(Boolean),
-        identifier: row.identifier || '',
-        medium: row.medium || '',
-        extent: row.extent || '',
-        rights: row.rights || '',
-        notes: row.notes || '',
-        updatedAt: new Date().toISOString(),
-        status: 'unreviewed'
-      };
-      state.records.push(record);
+    const group = importGroup.value;
+    const action = '导入档案记录';
+    const detail = `从 ${group} 组导入 ${rows.length} 条记录`;
+    const prepared = rows.map((row) => ({
+      id: crypto.randomUUID(),
+      group,
+      title: row.title || '未命名记录',
+      date: row.date || '',
+      people: Array.isArray(row.people) ? row.people : String(row.people || '').split(/[，,、]/).filter(Boolean),
+      places: Array.isArray(row.places) ? row.places : String(row.places || '').split(/[，,、]/).filter(Boolean),
+      identifier: row.identifier || '',
+      medium: row.medium || '',
+      extent: row.extent || '',
+      rights: row.rights || '',
+      notes: row.notes || '',
+      updatedAt: new Date().toISOString(),
+      status: 'unreviewed' as const
+    }));
+    const ok = runGuarded(action, detail, [], () => {
+      state.records.push(...prepared);
+      // 重新匹配时保留既有复核结论，后导入的批次不会盖掉先前的确认/忽略。
+      state.matches = computeMatches(state.records, state.matches);
+      commit(action, detail, []);
     });
-    state.matches = computeMatches(state.records);
-    commit('导入档案记录', `从 ${importGroup.value} 组导入 ${rows.length} 条记录`, []);
-    importRaw.value = '';
-    importText.value = '';
-    importOpen.value = false;
-    notify(`已导入 ${rows.length} 条记录并重新匹配`);
+    if (ok) {
+      importRaw.value = '';
+      importText.value = '';
+      importOpen.value = false;
+      notify(`已导入 ${rows.length} 条记录并重新匹配`);
+    }
   });
 
   const importFile = $(async (_event: Event, element: HTMLInputElement) => {
@@ -259,13 +400,77 @@ export default component$(() => {
   });
 
   const exportAudit = $(() => {
-    const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), records: state.records, matches: state.matches, merges: state.merges, audit: state.audit }, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `档案元数据核对结果-${new Date().toISOString().slice(0, 10)}.json`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    downloadJson(`档案元数据核对结果-${new Date().toISOString().slice(0, 10)}.json`, {
+      exportedAt: new Date().toISOString(),
+      version: baseVersion.value,
+      records: state.records,
+      matches: state.matches,
+      merges: state.merges,
+      audit: state.audit,
+      checkpoints: checkpoints.value.map((cp) => ({ id: cp.id, at: cp.at, action: cp.action, detail: cp.detail, baseVersion: cp.baseVersion, pairs: cp.pairs }))
+    });
+  });
+
+  const exportBundles = $(() => {
+    downloadJson(`核对台错误包-${new Date().toISOString().slice(0, 10)}.json`, {
+      exportedAt: new Date().toISOString(),
+      note: '读取失败时保留的原始数据与错误信息',
+      bundles: loadErrorBundles(localStorage)
+    });
+  });
+
+  const dismissNotice = $((id: string) => {
+    notices.value = notices.value.filter((notice) => notice.id !== id);
+  });
+
+  const restoreCheckpoint = $((cp: Checkpoint) => {
+    const raw = JSON.stringify(cp.data);
+    const detail = `回到检查点「${cp.action}」（${new Date(cp.at).toLocaleString('zh-CN')}）`;
+    const ok = runGuarded('恢复检查点', detail, cp.pairs, () => restore(raw));
+    if (ok) {
+      checkpointOpen.value = false;
+      selectedMatchIds.value = [];
+      notify('已回到所选检查点，原版本仍保留在检查点列表中');
+    }
+  });
+
+  /** 看完差异后重新领取：载入对方最新版本，放弃本地被拦截的改动，再在新版本上重做。 */
+  const resync = $(() => {
+    const storage: StorageLike = localStorage;
+    const loaded = loadEnvelope(storage);
+    if (!loaded.envelope) {
+      notify('本地工作区暂时无法读取，请先导出错误包');
+      return;
+    }
+    const env = loaded.envelope;
+    const lease = acquireLease(storage, holder.value, '重新领取编辑权');
+    if (!lease.ok) {
+      notify(`对方仍在保存（${lease.conflict?.holder}），请稍后再试`);
+      return;
+    }
+    if (conflict.value?.kind === 'lease') {
+      releaseLease(storage, holder.value);
+      conflict.value = null;
+      notify('已重新领取编辑权，可以重试刚才的操作');
+      return;
+    }
+    history.value = [...history.value.slice(-49), snapshot()];
+    future.value = [];
+    restore(JSON.stringify(env.data));
+    commit('重新领取编辑权并同步', `载入对方 r${env.version}（${env.lastAction}）的差异内容，请在此版本上重做操作`, []);
+    const result = saveEnvelope(storage, snapshotData(), env.version, holder.value, '重新领取编辑权并同步');
+    releaseLease(storage, holder.value);
+    if (!result.ok || !result.envelope) {
+      if (result.conflict) conflict.value = result.conflict;
+      notify('对方又提交了新版本，请再次查看差异');
+      return;
+    }
+    baseVersion.value = result.envelope.version;
+    state.revision = result.envelope.version;
+    remoteAhead.value = null;
+    conflict.value = null;
+    checkpoints.value = loadCheckpoints(storage).checkpoints;
+    notify(`已同步到 r${result.envelope.version}，请按差异重做被拦截的操作`);
   });
 
   const moveReview = $((delta: number) => {
@@ -278,22 +483,51 @@ export default component$(() => {
     }
   });
 
+  /* 启动：迁移旧版数据 / 崩溃恢复 / 载入版本信封。 */
   useVisibleTask$(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const saved = JSON.parse(raw) as Partial<ArchiveState>;
-        restore(JSON.stringify(saved));
-      }
-    } catch {
-      localStorage.removeItem(STORAGE_KEY);
-    }
+    holder.value = createHolder();
+    const result = boot(localStorage, () => {
+      const seeded = seedState();
+      return {
+        revision: seeded.revision,
+        records: seeded.records,
+        matches: seeded.matches,
+        merges: seeded.merges,
+        audit: seeded.audit
+      };
+    });
+    restore(JSON.stringify(result.envelope.data));
+    baseVersion.value = result.envelope.version;
+    state.revision = result.envelope.version;
+    checkpoints.value = result.checkpoints;
+    notices.value = result.notices;
     state.hydrated = true;
-  });
 
-  useVisibleTask$(({ track }) => {
-    const payload = track(() => JSON.stringify({ revision: state.revision, records: state.records, matches: state.matches, merges: state.merges, audit: state.audit }));
-    if (state.hydrated) localStorage.setItem(STORAGE_KEY, payload);
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === 'sologsb-1020-archive-v2') {
+        const loaded = loadEnvelope(localStorage);
+        if (loaded.envelope && loaded.envelope.version > baseVersion.value) {
+          remoteAhead.value = { version: loaded.envelope.version, action: loaded.envelope.lastAction, by: loaded.envelope.updatedBy };
+        }
+      }
+      if (event.key === 'sologsb-1020-pending') {
+        if (event.newValue) {
+          try {
+            const marker = JSON.parse(event.newValue) as PendingMarker;
+            if (marker.holder !== holder.value) remotePending.value = marker.action;
+          } catch { /* 忽略损坏的进行中标记 */ }
+        } else {
+          remotePending.value = '';
+        }
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    const release = () => { if (holder.value) releaseLease(localStorage, holder.value); };
+    window.addEventListener('pagehide', release);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener('pagehide', release);
+    };
   });
 
   useVisibleTask$(({ cleanup }) => {
@@ -320,6 +554,9 @@ export default component$(() => {
     cleanup(() => window.removeEventListener('keydown', handler));
   });
 
+  const noticeTone = (kind: RecoveryNotice['kind']) =>
+    kind === 'quarantine' ? 'danger' : kind === 'interrupted' || kind === 'checkpoint' ? 'warn' : 'info';
+
   return (
     <div class="app-shell">
       <header class="topbar">
@@ -327,14 +564,57 @@ export default component$(() => {
           <div class="brand-seal">档</div>
           <div><h1>档案元数据核对台</h1><p>ARCHIVE RECONCILIATION DESK</p></div>
         </div>
-        <div class="top-stat"><span class="online-dot" />{state.hydrated ? `离线保存 · r${state.revision}` : '正在恢复本地工作区'}</div>
+        <div class="top-stat">
+          <span class="online-dot" />
+          {state.hydrated ? `离线保存 · 版本 r${baseVersion.value}` : '正在恢复本地工作区'}
+          {remotePending.value && <span class="lease-tag">对方正在{remotePending.value}…</span>}
+          {remoteAhead.value && (
+            <button class="lease-tag clash" onClick$={() => {
+              const ahead = remoteAhead.value;
+              if (!ahead) return;
+              const loaded = loadEnvelope(localStorage);
+              if (loaded.envelope) {
+                const built = buildVersionConflict('同步对方已保存的版本', snapshotData(), baseVersion.value, loaded.envelope);
+                showConflict({ ...built, kind: 'remote', action: '检测到其他页面的新版本' });
+              }
+            }}>对方已保存 r{remoteAhead.value.version} · 查看</button>
+          )}
+        </div>
         <div class="top-actions">
           <button class="icon-button" disabled={!history.value.length} onClick$={undo}>撤销</button>
           <button class="icon-button" disabled={!future.value.length} onClick$={redo}>重做</button>
+          <button class="icon-button" onClick$={() => checkpointOpen.value = true}>检查点</button>
           <button class="button ghost" onClick$={() => importOpen.value = true}>导入两组记录</button>
           <button class="button light" onClick$={exportAudit}>导出核对包</button>
         </div>
       </header>
+
+      {notices.value.length > 0 && (
+        <div class="notice-stack">
+          {notices.value.map((notice) => (
+            <div class={`notice-banner ${noticeTone(notice.kind)}`} key={notice.id}>
+              <div class="notice-body">
+                <strong>{notice.title}</strong>
+                <p>{notice.detail}</p>
+                {notice.pairs && notice.pairs.length > 0 && (
+                  <ul class="notice-pairs">
+                    {notice.pairs.slice(0, 6).map((pair, index) => (
+                      <li key={`${pair.leftId}-${pair.rightId}-${index}`}>{pairText(state, pair)}<span>{pair.reason}</span></li>
+                    ))}
+                    {notice.pairs.length > 6 && <li>…另有 {notice.pairs.length - 6} 对记录</li>}
+                  </ul>
+                )}
+              </div>
+              <div class="notice-actions">
+                {notice.bundles.map((bundle) => (
+                  <button class="button small danger" key={bundle.id} onClick$={exportBundles}>导出错误包</button>
+                ))}
+                <button class="button small ghost" onClick$={() => dismissNotice(notice.id)}>知道了</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div class="overview">
         <div><span class="eyebrow">RECONCILIATION PROJECT</span><h2>口述史与手稿元数据比对</h2><p>逐条确认可疑匹配，保留每个字段的来源选择，并留下可追溯的处理记录。</p></div>
@@ -458,7 +738,7 @@ export default component$(() => {
 
       <section class="bottom-grid">
         <article class="panel audit-panel">
-          <div class="panel-heading"><div><span class="eyebrow">03 / TRACE</span><h3>最新处理记录</h3></div><span>{state.audit.length} 条</span></div>
+          <div class="panel-heading"><div><span class="eyebrow">03 / TRACE</span><h3>最新处理记录</h3></div><span>{state.audit.length} 条 · 最近检查点 {checkpoints.value[0] ? new Date(checkpoints.value[0].at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '无'}</span></div>
           <div class="audit-list">
             {state.audit.slice(0, 8).map((entry) => <div class="audit-entry" key={entry.id}><time>{new Date(entry.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time><div><strong>{entry.action}</strong><p>{entry.detail}</p></div><span>{entry.recordIds.length ? `${entry.recordIds.length} 条记录` : '系统'}</span></div>)}
           </div>
@@ -467,17 +747,108 @@ export default component$(() => {
           <div class="panel-heading"><div><span class="eyebrow">METHOD</span><h3>匹配与保护规则</h3></div></div>
           <p>标题、日期、人物、地点和编号按权重综合评分。低于 68% 的候选会以红色标记，但系统不会替研究者自动决定。</p>
           <div class="rule-row"><span>1</span><p>每个字段保留 A / B 来源，可在合并窗口中单独选择或拼接。</p></div>
-          <div class="rule-row"><span>2</span><p>原始记录、合并结果和忽略理由都进入本地审计轨迹。</p></div>
-          <div class="rule-row"><span>3</span><p>记录列表使用分批窗口渲染，导入大量数据时仍只挂载当前窗口。</p></div>
+          <div class="rule-row"><span>2</span><p>提交前领取编辑权并携带当时版本；版本落后直接拦住写入，指出冲突动作与被取代记录对，看完差异再重新领取。</p></div>
+          <div class="rule-row"><span>3</span><p>每批确认、忽略、合并、导入前都落盘检查点；刷新或崩溃后自动回到最近检查点。</p></div>
+          <div class="rule-row"><span>4</span><p>旧版本地数据自动迁移；读取失败时原数据进隔离区并可导出错误包。</p></div>
         </article>
       </section>
 
       {toast.value && <div class="toast">{toast.value}</div>}
 
+      {/* 版本冲突：列出冲突动作、版本与被取代的记录对 */}
+      <Modal.Root bind:show={conflictOpen} closeOnBackdropClick={false}>
+        <Modal.Panel class="modal-panel conflict-modal">
+          <Modal.Header class="modal-header">
+            <div><span class="eyebrow">VERSION CONFLICT</span><Modal.Title>
+              {conflict.value?.kind === 'lease' ? '其他页面正在编辑' : conflict.value?.kind === 'unreadable' ? '本地工作区读取失败' : '版本落后，写入已拦截'}
+            </Modal.Title></div>
+            <Modal.Close class="modal-close">×</Modal.Close>
+          </Modal.Header>
+          {conflict.value && (
+            <>
+              <Modal.Description class="modal-description">
+                被拦截的动作：<strong>{conflict.value.action}</strong>（基于 r{conflict.value.baseVersion}）。
+                {conflict.value.kind === 'version' || conflict.value.kind === 'remote'
+                  ? ` 当前最新版本 r${conflict.value.currentVersion}，对方页面 ${conflict.value.remoteBy} 于 ${conflict.value.remoteAt ? new Date(conflict.value.remoteAt).toLocaleString('zh-CN') : ''} 保存了「${conflict.value.remoteAction}」。以下记录对存在冲突，你的本地改动已回滚，看完差异后请重新领取编辑权并重做。`
+                  : conflict.value.detail}
+              </Modal.Description>
+              {(conflict.value.kind === 'version' || conflict.value.kind === 'remote') && (
+                <div class="conflict-list">
+                  {conflict.value.pairs.length === 0 && <div class="empty-state">两边数据没有记录级差异，直接重新领取即可在最新版本上继续。</div>}
+                  {conflict.value.pairs.slice(0, 40).map((pair) => (
+                    <details class="conflict-item" key={`${pair.kind}-${pair.id}`}>
+                      <summary>
+                        <span class={`conflict-kind ${pair.kind}`}>{conflictKindLabel[pair.kind]}</span>
+                        <strong>{pair.label}</strong>
+                      </summary>
+                      <div class="conflict-actions"><div><small>你的动作</small><p>{pair.localAction}</p></div><div><small>对方动作</small><p>{pair.remoteAction}</p></div></div>
+                      {pair.fields && pair.fields.length > 0 && (
+                        <div class="conflict-fields">
+                          <div class="field-picker-head inner"><span>字段</span><span>你的取值（r{conflict.value!.baseVersion}）</span><span>对方取值（r{conflict.value!.currentVersion}）</span></div>
+                          {pair.fields.map((f) => (
+                            <div class="conflict-field-row" key={f.field}>
+                              <span>{fieldLabels.find(([key]) => key === f.field)?.[1] ?? f.field}</span>
+                              <b>{f.local || '—'}</b>
+                              <i>{f.remote || '—'}</i>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </details>
+                  ))}
+                  {conflict.value.pairs.length > 40 && <div class="empty-state">另有 {conflict.value.pairs.length - 40} 条差异未展开。</div>}
+                </div>
+              )}
+              <Modal.Footer class="modal-footer">
+                {conflict.value.kind === 'unreadable' && <button class="button danger" onClick$={exportBundles}>导出错误包</button>}
+                <Modal.Close class="button ghost">关闭</Modal.Close>
+                <button class="button primary" onClick$={resync}>
+                  {conflict.value.kind === 'lease' ? '重新领取编辑权' : `看差异后重新领取（载入 r${conflict.value.currentVersion}）`}
+                </button>
+              </Modal.Footer>
+            </>
+          )}
+        </Modal.Panel>
+      </Modal.Root>
+
+      {/* 恢复点列表 */}
+      <Modal.Root bind:show={checkpointOpen} closeOnBackdropClick>
+        <Modal.Panel class="modal-panel checkpoint-modal">
+          <Modal.Header class="modal-header">
+            <div><span class="eyebrow">CHECKPOINTS</span><Modal.Title>检查点与恢复</Modal.Title></div>
+            <Modal.Close class="modal-close">×</Modal.Close>
+          </Modal.Header>
+          <Modal.Description class="modal-description">
+            每批确认、忽略、合并和导入前都会在此留下检查点（保留最近 20 条）。刷新或崩溃后自动回到最近检查点，也可以手动回到任意一条；恢复操作本身会再生成一个检查点。
+          </Modal.Description>
+          <div class="checkpoint-list">
+            {checkpoints.value.length === 0 && <div class="empty-state">还没有检查点。完成一次确认、忽略、合并或导入后出现。</div>}
+            {checkpoints.value.map((cp) => (
+              <details class="checkpoint-item" key={cp.id}>
+                <summary>
+                  <div><strong>{cp.action}</strong><small>{new Date(cp.at).toLocaleString('zh-CN')} · 基于 r{cp.baseVersion}</small></div>
+                  <span>{cp.pairs.length} 对记录</span>
+                </summary>
+                <p>{cp.detail}</p>
+                {cp.pairs.length > 0 && (
+                  <ul class="notice-pairs">
+                    {cp.pairs.slice(0, 8).map((pair, index) => (
+                      <li key={`${cp.id}-${index}`}>{pairText(state, pair)}<span>{pair.reason}</span></li>
+                    ))}
+                    {cp.pairs.length > 8 && <li>…另有 {cp.pairs.length - 8} 对记录</li>}
+                  </ul>
+                )}
+                <button class="button small" onClick$={() => restoreCheckpoint(cp)}>回到此检查点</button>
+              </details>
+            ))}
+          </div>
+        </Modal.Panel>
+      </Modal.Root>
+
       <Modal.Root bind:show={importOpen} closeOnBackdropClick>
         <Modal.Panel class="modal-panel import-modal">
           <Modal.Header class="modal-header"><div><span class="eyebrow">IMPORT</span><Modal.Title>导入一组档案记录</Modal.Title></div><Modal.Close class="modal-close">×</Modal.Close></Modal.Header>
-          <Modal.Description class="modal-description">支持 JSON 数组或制表符 / 竖线分隔文本。字段顺序：标题、日期、人物、地点、编号、载体、数量、权利、备注。</Modal.Description>
+          <Modal.Description class="modal-description">支持 JSON 数组或制表符 / 竖线分隔文本。字段顺序：标题、日期、人物、地点、编号、载体、数量、权利、备注。既有复核结论在重新匹配后仍然保留。</Modal.Description>
           <div class="import-controls">
             <label class="radio-card"><input type="radio" checked={importGroup.value === 'A'} onChange$={() => importGroup.value = 'A'} /><span><strong>A 组</strong><small>口述史 / 主要记录</small></span></label>
             <label class="radio-card"><input type="radio" checked={importGroup.value === 'B'} onChange$={() => importGroup.value = 'B'} /><span><strong>B 组</strong><small>手稿 / 待合并记录</small></span></label>

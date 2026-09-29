@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --mode ssr",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "bash scripts/run-tests.sh"
   },
   "dependencies": {
     "@builder.io/qwik": "^1.20.1",

@@ -63,7 +63,10 @@ export function scorePair(left: ArchiveRecord, right: ArchiveRecord) {
   return { score: Math.min(1, score), fieldScores, reasons };
 }
 
-export function computeMatches(records: ArchiveRecord[]): MatchCandidate[] {
+export function computeMatches(records: ArchiveRecord[], previous: MatchCandidate[] = []): MatchCandidate[] {
+  // 导入新记录重新匹配时，保留既有复核结论（确认 / 忽略 / 合并与复核时间），
+  // 不因后保存的批次把先前的判断盖回去。
+  const previousById = new Map(previous.map((match) => [match.id, match]));
   const left = records.filter((record) => record.group === 'A');
   const right = records.filter((record) => record.group === 'B');
   const matches: MatchCandidate[] = [];
@@ -73,14 +76,17 @@ export function computeMatches(records: ArchiveRecord[]): MatchCandidate[] {
       .sort((x, y) => y.score - x.score)
       .slice(0, 4);
     candidates.forEach((candidate) => {
+      const id = `match-${a.id}-${candidate.record.id}`;
+      const prior = previousById.get(id);
       matches.push({
-        id: `match-${a.id}-${candidate.record.id}`,
+        id,
         leftId: a.id,
         rightId: candidate.record.id,
         score: candidate.score,
         fieldScores: candidate.fieldScores,
-        status: 'suggested',
-        reasons: candidate.reasons
+        status: prior?.status ?? 'suggested',
+        reasons: candidate.reasons,
+        ...(prior?.reviewedAt ? { reviewedAt: prior.reviewedAt } : {})
       });
     });
   });

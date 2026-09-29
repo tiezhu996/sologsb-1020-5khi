@@ -153,3 +153,45 @@ kbd { justify-self: start; padding: 3px 6px; border: 1px solid #c8d2d5; border-b
 .qwik-check { display: grid; place-items: center; width: 17px; height: 17px; border: 1px solid #b9c8cc; border-radius: 4px; background: white; cursor: pointer; }
 .qwik-check[aria-checked="true"] { color: white; border-color: #3d7c89; background: #3d7c89; }
 @media (max-width: 1330px) { .desk-grid { grid-template-columns: minmax(330px, 1fr) minmax(380px, 1.15fr) minmax(300px, .85fr); gap: 10px; padding: 0 12px; } .overview, .bottom-grid { padding-left: 12px; padding-right: 12px; } .metrics { gap: 14px; } }
+
+/* 多页面版本协作 */
+.lease-tag { border: 1px solid rgba(255,255,255,.4); border-radius: 6px; padding: 3px 8px; color: white; background: transparent; font-size: 9px; }
+button.lease-tag { cursor: pointer; }
+.lease-tag.clash { color: #2c2310; border-color: #e8c786; background: #e8c786; font-weight: 700; }
+.notice-stack { display: grid; gap: 8px; padding: 12px 18px 0; }
+.notice-banner { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; padding: 12px 15px; border-radius: 10px; border: 1px solid; font-size: 10px; }
+.notice-banner.info { color: #27535f; background: #e9f3f4; border-color: #b9d6db; }
+.notice-banner.warn { color: #6e4e17; background: #fbf1dc; border-color: #e3c88e; }
+.notice-banner.danger { color: #7c3a2d; background: #f8e7e2; border-color: #ddb3a8; }
+.notice-banner strong { font-size: 12px; }
+.notice-banner p { margin: 3px 0 0; line-height: 1.55; }
+.notice-actions { display: flex; gap: 6px; flex: 0 0 auto; align-items: center; }
+.notice-pairs { margin: 8px 0 0; padding: 8px 10px; border-radius: 7px; background: rgba(255,255,255,.55); list-style: none; max-height: 132px; overflow: auto; }
+.notice-pairs li { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; color: inherit; }
+.notice-pairs li span { color: rgba(0,0,0,.55); white-space: nowrap; }
+
+/* 冲突弹窗 */
+.conflict-modal, .checkpoint-modal { width: min(820px, calc(100vw - 32px)); }
+.conflict-list, .checkpoint-list { max-height: 56vh; overflow: auto; padding: 0 20px 6px; display: grid; gap: 7px; }
+.conflict-item, .checkpoint-item { border: 1px solid #e0e7e9; border-radius: 8px; background: #f7f9f9; padding: 9px 11px; font-size: 10px; }
+.conflict-item[open], .checkpoint-item[open] { background: #fff; box-shadow: 0 4px 14px rgba(23,50,71,.08); }
+.conflict-item > summary, .checkpoint-item > summary { display: flex; align-items: center; gap: 8px; cursor: pointer; list-style: none; }
+.checkpoint-item > summary { justify-content: space-between; }
+.checkpoint-item > summary > div { display: flex; flex-direction: column; }
+.checkpoint-item > summary small { color: var(--muted); margin-top: 2px; }
+.checkpoint-item > summary > span { color: #87939a; font-size: 9px; }
+.conflict-kind { flex: 0 0 auto; padding: 2px 7px; border-radius: 6px; color: #315f77; background: #dcebf2; font-size: 8px; font-weight: 700; }
+.conflict-kind.record { color: #276246; background: #dcf0e5; }
+.conflict-kind.merge { color: #8b5d18; background: #faedcf; }
+.conflict-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 9px; }
+.conflict-actions > div { padding: 8px; border-radius: 7px; background: #f2f6f6; }
+.conflict-actions small { color: var(--muted); }
+.conflict-actions p { margin: 3px 0 0; line-height: 1.5; color: #3c535c; }
+.conflict-fields { margin-top: 8px; }
+.field-picker-head.inner { display: grid; grid-template-columns: 64px 1fr 1fr; gap: 6px; padding: 6px 9px; font-size: 8px; border-radius: 7px 7px 0 0; }
+.conflict-field-row { display: grid; grid-template-columns: 64px 1fr 1fr; gap: 6px; padding: 6px 9px; border-top: 1px solid #e6ecee; font-size: 9px; line-height: 1.5; }
+.conflict-field-row span { color: var(--muted); font-weight: 700; }
+.conflict-field-row b { color: #8d4938; font-weight: 600; word-break: break-word; }
+.conflict-field-row i { color: #2f6d83; font-style: normal; word-break: break-word; }
+.checkpoint-item p { margin: 8px 0; color: var(--muted); line-height: 1.55; }
+.checkpoint-item .button { margin-top: 4px; }
